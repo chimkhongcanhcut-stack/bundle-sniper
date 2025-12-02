@@ -9,7 +9,7 @@ const DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/144503763263894737
 const WS_URL = "wss://pumpportal.fun/api/data";
 
 const BUNDLE_WINDOW_MS = 2000;
-const MIN_TRADES = 6;
+const MIN_TRADES = 2;
 const MIN_TOTAL_SOL = 30;
 const BIG_SINGLE_BUY_SOL = 15;
 
@@ -206,3 +206,4 @@ function connect() {
 
 log("🚀 Pump.fun Bundle Watch starting...");
 connect();
+
