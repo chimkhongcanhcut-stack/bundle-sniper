@@ -1,235 +1,160 @@
 // pump-bundle-watch.js
-// 🛰 Pump.fun Bundle Radar (watch-only, không trade)
-
 const WebSocket = require("ws");
 const axios = require("axios");
 
-// ================== CONFIG ==================
+// CONFIG
 const DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1445037632638947371/ivpVM-yYXgZns66PiwtSRlcgHBjrFAEgfdxW2koOvchceiS4wsSL3RaGdk1TEkI20HF1";
 const WS_URL = "wss://pumpportal.fun/api/data";
 
-// 👉 Làm bot nhạy hơn
-const BUNDLE_WINDOW_MS = 3000;   // gom trong 3s (trước là 2s)
-const MIN_TRADES = 2;           // vẫn 2 lệnh
-const MIN_TOTAL_SOL = 5;        // tổng từ ~5 SOL trở lên (trước 30 SOL)
-const BIG_SINGLE_BUY_SOL = 4;   // 1 phát >= 4 SOL là ping (trước 15 SOL)
+// Tuning
+const BUNDLE_WINDOW_MS = 3000;
+const MIN_TRADES = 2;
+const MIN_TOTAL_SOL = 5;
+const BIG_SINGLE_BUY_SOL = 4;
+
+// ❗ NEW: chỉ ping nếu marketcap >= 30K$
+const MIN_MARKETCAP_USD = 30000;
+
+// bạn có thể chỉnh nếu SOL pump/dump
+const SOL_PRICE_USD = 120;
+const MIN_MARKETCAP_SOL = MIN_MARKETCAP_USD / SOL_PRICE_USD;  // ~250 SOL
 
 const DEBUG_TRADES = true;
-const DEBUG_RAW_LIMIT = 10;
 
-// ================== STATE ==================
 const perMint = {};
 let ws = null;
-let debugRawCount = 0;
 
-function now() {
-  return Date.now();
-}
+function now(){return Date.now();}
+function log(m){console.log(`[${new Date().toLocaleTimeString()}] ${m}`)}
 
-function log(msg) {
-  console.log(`[${new Date().toLocaleTimeString()}] ${msg}`);
-}
-
-function ensureMintState(mint) {
-  if (!perMint[mint]) {
-    perMint[mint] = {
+function ensureMint(m){
+  if(!perMint[m]){
+    perMint[m] = {
       createdAt: now(),
       lastVSOL: null,
       trades: [],
-      alerted: false,
-      name: null,
+      alerted:false,
+      name:null,
+      marketCapSol:0
     };
   }
-  return perMint[mint];
+  return perMint[m];
 }
 
-// ================== UTILS ==================
-function extractSolGeneric(event) {
-  if (typeof event.solAmount === "number" && event.solAmount > 0) return event.solAmount;
-  if (typeof event.sol === "number" && event.sol > 0) return event.sol;
-  if (typeof event.lamports === "number" && event.lamports > 0) return event.lamports / 1e9;
-  if (typeof event.amount === "number" && event.amount > 0)
-    return event.amount > 1e6 ? event.amount / 1e9 : event.amount;
-  if (typeof event.value === "number" && event.value > 0) return event.value;
+function extractSolGeneric(e) {
+  if (e.solAmount>0) return e.solAmount;
+  if (e.sol>0) return e.sol;
+  if (e.lamports>0) return e.lamports/1e9;
+  if (e.amount>0) return e.amount>1e6?e.amount/1e9:e.amount;
   return 0;
 }
 
-function classifyBundle(trades, totalSol, maxSingleSol) {
-  // vẫn giữ label 80/60/50% nhưng ngưỡng hợp lý hơn
-  if (maxSingleSol >= 15) return "🐳 80%";              // whale thực sự
-  if (maxSingleSol >= 8 || totalSol >= 12) return "🚀 60%"; // bundle khá to
-  if (totalSol >= 5) return "🧨 50%";                   // kèo vừa, early alert
+function classifyBundle(totalSol, maxSingle) {
+  if (maxSingle >= 15) return "🐳 80%";
+  if (maxSingle >= 8 || totalSol >= 12) return "🚀 60%";
+  if (totalSol >= 5) return "🧨 50%";
   return "📌 BUNDLE";
 }
 
-async function sendAlert(mint, stats) {
-  const { trades, totalSol, maxSingleSol, dominancePercent, windowSec, createdAt, name } = stats;
+async function sendAlert(mint, stats){
+  const { trades, totalSol, maxSingle, dominancePercent, windowSec, createdAt, name, marketCapSol } = stats;
 
-  const bundleType = classifyBundle(trades, totalSol, maxSingleSol);
-  const axiomLink = `https://axiom.trade/t/${mint}`;
-
-  const desc =
-    `🧩 **Trades:** ${trades.length} trong ~${windowSec}s\n` +
-    `💰 **Tổng ước tính:** ${totalSol.toFixed(3)} SOL\n` +
-    `💣 **Biggest single buy:** ~${maxSingleSol.toFixed(3)} SOL\n` +
-    `📊 **Dominance:** ~${dominancePercent}%\n` +
-    `📜 **CA:** \`${mint}\`\n` +
-    `⏱ Age: ${createdAt ? `${Math.round((now() - createdAt) / 1000)}s` : "unknown"}`;
+  const type = classifyBundle(totalSol,maxSingle);
+  const axiom = `https://axiom.trade/t/${mint}`;
 
   const embed = {
-    title: `🎯 BUNDLE DETECTED – ${bundleType} — ${name ?? ""}`,
-    description: desc,
-    color:
-      bundleType === "🐳 80%"
-        ? 0xff0000
-        : bundleType === "🚀 60%"
-        ? 0x00ff9d
-        : 0xf7a600,
-    fields: [
-      {
-        name: "🔗 OPEN",
-        value: `[💥 **AXIOM** 💥](${axiomLink})`,
-      },
-    ],
-    timestamp: new Date().toISOString(),
+    title:`🎯 ${type} — ${name ?? ""}`,
+    description:
+      `🧩 Trades: ${trades.length} trong ${windowSec}s\n`+
+      `💰 Total: ${totalSol.toFixed(2)} SOL\n`+
+      `💣 Biggest: ${maxSingle.toFixed(2)} SOL\n`+
+      `📊 Dominance: ${dominancePercent}%\n`+
+      `🏷 MarketCap: ~${marketCapSol.toFixed(1)} SOL (~$${(marketCapSol*SOL_PRICE_USD).toFixed(0)})\n`+
+      `📜 CA: \`${mint}\`\n\n`,
+    color:type==="🐳 80%"?0xff0000:type==="🚀 60%"?0x00ff9d:0xf7a600,
+    fields:[{name:"🔗 OPEN",value:`[AXIOM](${axiom})`}],
+    timestamp:new Date().toISOString()
   };
 
-  await axios.post(DISCORD_WEBHOOK_URL, {
-    content: `@everyone 🔥 **BUNDLE DETECTED** — \`${mint}\``,
-    embeds: [embed],
+  await axios.post(DISCORD_WEBHOOK_URL,{
+    content:`@everyone 🔥 **BUNDLE DETECTED** — \`${mint}\``,
+    embeds:[embed]
   });
 
-  log(`📩 Alert sent for mint ${mint}`);
+  log(`📩 Alert sent for ${mint}`);
 }
 
-// ================== CORE BUNDLE LOGIC ==================
-function recordTrade(mint, buyer, deltaSol) {
-  const s = ensureMintState(mint);
+function recordTrade(mint,buyer,sol){
+  const s = ensureMint(mint);
 
-  const t = { ts: now(), buyer, deltaSol };
-  s.trades.push(t);
+  s.trades.push({ts:now(),buyer,sol});
+  s.trades = s.trades.filter(t=>t.ts>=now()-BUNDLE_WINDOW_MS);
 
-  const cutoff = t.ts - BUNDLE_WINDOW_MS;
-  s.trades = s.trades.filter((x) => x.ts >= cutoff);
+  const totalSol = s.trades.reduce((a,t)=>a+t.sol,0);
+  const maxSingle = Math.max(...s.trades.map(t=>t.sol));
+  const dominancePercent = ((Math.max(...Object.values(
+    s.trades.reduce((m,t)=>((m[t.buyer]=(m[t.buyer]||0)+t.sol),m),{})
+  )) / totalSol) * 100).toFixed(1);
 
-  const trades = s.trades;
-  const totalSol = trades.reduce((sum, x) => sum + (x.deltaSol || 0), 0);
-  const maxSingleSol = trades.reduce((m, x) => (x.deltaSol > m ? x.deltaSol : m), 0);
+  if(s.alerted) return;
 
-  if (DEBUG_TRADES) {
-    log(
-      `TRADE mint=${mint} | buyer=${buyer.slice(
-        0,
-        4
-      )}... | delta≈${deltaSol.toFixed(4)} | trades=${trades.length} | total≈${totalSol.toFixed(
-        3
-      )}`
-    );
-  }
+  const isBundle = (s.trades.length>=MIN_TRADES && totalSol>=MIN_TOTAL_SOL) || (maxSingle >= BIG_SINGLE_BUY_SOL);
 
-  if (s.alerted) return;
-
-  const agg = {};
-  for (const x of trades) agg[x.buyer] = (agg[x.buyer] || 0) + (x.deltaSol || 0);
-  const maxBuyerSol = Object.values(agg).reduce((m, v) => (v > m ? v : m), 0);
-  const dominancePercent = totalSol > 0 ? ((maxBuyerSol / totalSol) * 100).toFixed(1) : 0;
-
-  const isMultiBundle = trades.length >= MIN_TRADES && totalSol >= MIN_TOTAL_SOL;
-  const isBigSingle = maxSingleSol >= BIG_SINGLE_BUY_SOL;
-
-  if (isMultiBundle || isBigSingle) {
+  // ❗ Stop nếu chưa đủ marketcap
+  if(isBundle && s.marketCapSol >= MIN_MARKETCAP_SOL){
     s.alerted = true;
-    log(`🎯 DETECTED mint=${mint}`);
-
-    sendAlert(mint, {
+    sendAlert(mint,{
       ...s,
-      trades,
+      trades:s.trades,
       totalSol,
-      maxSingleSol,
+      maxSingle,
       dominancePercent,
-      windowSec: (BUNDLE_WINDOW_MS / 1000).toFixed(1),
-      createdAt: s.createdAt,
-    }).catch(() => {});
+      windowSec:(BUNDLE_WINDOW_MS/1000).toFixed(1)
+    });
   }
 }
 
-// ---------- WebSocket Handlers ----------
-function handleCreatePortal(msg) {
-  const mint = msg.mint;
-  if (!mint) return;
-  const s = ensureMintState(mint);
-  s.createdAt = now();
-  s.trades = [];
-  s.alerted = false;
-  s.name = msg.name || msg.symbol || msg.ticker || null;
-
-  ws.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
+function handleCreate(msg){
+  const s = ensureMint(msg.mint);
+  s.name = msg.name || msg.symbol;
+  s.marketCapSol = msg.marketCapSol || 0;
 }
 
-function handleBuyPortal(msg) {
-  const mint = msg.mint;
-  if (!mint) return;
-  const s = ensureMintState(mint);
+function handleBuy(msg){
+  const s = ensureMint(msg.mint);
+  s.marketCapSol = msg.marketCapSol ?? s.marketCapSol;
 
-  if (typeof msg.vSolInBondingCurve === "number") {
+  if(typeof msg.vSolInBondingCurve === "number"){
     const prev = s.lastVSOL ?? msg.vSolInBondingCurve;
     const diff = msg.vSolInBondingCurve - prev;
-    if (diff > 0) {
-      const buyer = msg.traderPublicKey || msg.trader || "unknown";
-      recordTrade(mint, buyer, diff);
-    }
+    if(diff>0) recordTrade(msg.mint,msg.traderPublicKey||msg.trader||"unknown",diff);
     s.lastVSOL = msg.vSolInBondingCurve;
   }
 }
 
-function handleGenericTrade(msg) {
-  const mint = msg.mint || msg.token || msg.ca;
-  if (!mint) return;
-
-  if (!(msg.side === "buy" || msg.is_buy)) return;
-
-  const buyer = msg.traderPublicKey || msg.trader || msg.user || "unknown";
+function handleGeneric(msg){
+  const mint = msg.mint;
+  if(!(msg.side==="buy"||msg.is_buy)) return;
   const sol = extractSolGeneric(msg);
-  if (sol > 0) recordTrade(mint, buyer, sol);
+  if(sol>0) recordTrade(mint,msg.trader||msg.user||"unknown",sol);
 }
 
-function handleMessage(data) {
-  let msg;
-  try {
-    msg = JSON.parse(data.toString());
-  } catch {
-    return;
-  }
+function handleMsg(raw){
+  let msg; try{msg=JSON.parse(raw);}catch{return;}
+  if(!msg.mint) return;
 
-  if (!msg.mint) return;
+  if(msg.txType==="create") return handleCreate(msg);
+  if(msg.txType==="buy") return handleBuy(msg);
 
-  if (msg.txType) {
-    const t = msg.txType.toLowerCase();
-    if (t === "create") return handleCreatePortal(msg);
-    if (t === "buy") return handleBuyPortal(msg);
-    return;
-  }
-
-  handleGenericTrade(msg);
+  handleGeneric(msg);
 }
 
 function connect() {
   ws = new WebSocket(WS_URL);
-
-  ws.on("open", () => {
-    log("✅ WS connected → subscribeNewToken");
-    ws.send(JSON.stringify({ method: "subscribeNewToken" }));
-  });
-
-  ws.on("message", handleMessage);
-  ws.on("close", () => {
-    log("⚠️ WS closed, reconnecting in 3s...");
-    setTimeout(connect, 3000);
-  });
-  ws.on("error", (err) => {
-    log("WS error: " + (err.message || err));
-  });
+  ws.on("open", ()=>ws.send(JSON.stringify({method:"subscribeNewToken"})));
+  ws.on("message",handleMsg);
+  ws.on("close",()=>setTimeout(connect,3000));
 }
 
-log("🚀 Pump.fun Bundle Watch starting...");
+log("🚀 Pump Bundle Watch (with marketcap filter) running...");
 connect();
