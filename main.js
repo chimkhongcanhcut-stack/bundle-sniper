@@ -1,244 +1,187 @@
-// pump-bundle-watch.js
+// pump-bundle-watch.optimized.js
 const WebSocket = require("ws");
 const axios = require("axios");
 
-// CONFIG
-const DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1445037632638947371/ivpVM-yYXgZns66PiwtSRlcgHBjrFAEgfdxW2koOvchceiS4wsSL3RaGdk1TEkI20HF1";
+// ================= CONFIG =================
+const DISCORD_WEBHOOK_URL = "YOUR_WEBHOOK";
 const WS_URL = "wss://pumpportal.fun/api/data";
 
-// Tuning
+// Detection tuning
 const BUNDLE_WINDOW_MS = 3000;
 const MIN_TRADES = 2;
 const MIN_TOTAL_SOL = 5;
 const BIG_SINGLE_BUY_SOL = 4;
 
-// ❗ Chỉ ping nếu marketcap >= 30K$
-const MIN_MARKETCAP_USD = 30000;
-
-// bạn có thể chỉnh nếu SOL pump/dump
+// Marketcap filter
 const SOL_PRICE_USD = 120;
-const MIN_MARKETCAP_SOL = MIN_MARKETCAP_USD / SOL_PRICE_USD;  // ~250 SOL
+const MIN_MARKETCAP_USD = 30000;
+const MIN_MARKETCAP_SOL = MIN_MARKETCAP_USD / SOL_PRICE_USD;
 
-const DEBUG_TRADES = true;
+// Memory control
+const MINT_TTL_MS = 2 * 60 * 1000; // 2 phút không activity là xoá
+const CLEANUP_INTERVAL_MS = 30 * 1000;
 
-const perMint = {};
+// ================= STATE =================
+const perMint = Object.create(null);
 let ws = null;
 
 function now() { return Date.now(); }
-function log(m) { console.log(`[${new Date().toLocaleTimeString()}] ${m}`); }
 
+// ================= HELPERS =================
 function ensureMint(m) {
-  if (!perMint[m]) {
-    perMint[m] = {
-      createdAt: now(),
-      lastVSOL: null,
-      trades: [],
-      alerted: false,
-      name: null,
-      marketCapSol: 0,
-      subscribedTrade: false, // ✅ để không subscribe trùng
-    };
-  }
-  return perMint[m];
+  return perMint[m] ??= {
+    lastTs: now(),
+    lastVSOL: 0,
+    trades: [],
+    alerted: false,
+    marketCapSol: 0,
+    subscribed: false,
+    name: ""
+  };
 }
 
-// ƯỚC LƯỢNG MARKETCAP (SOL) TỪ MESSAGE
-function estimateMarketCapSol(msg, prevMcSol = 0) {
-  // Nếu API sau này có marketCapSol thì xài luôn
-  if (typeof msg.marketCapSol === "number") return msg.marketCapSol;
-
-  // Nếu có USD thì convert sang SOL
-  if (typeof msg.marketCapUsd === "number") {
-    return msg.marketCapUsd / SOL_PRICE_USD;
-  }
-  if (typeof msg.marketCap === "number") {
-    return msg.marketCap / SOL_PRICE_USD;
-  }
-
-  // Pump.fun WS thường có vSolInBondingCurve
-  if (typeof msg.vSolInBondingCurve === "number") {
-    // Approx: FDV ≈ 2 * vSolInBondingCurve
-    return msg.vSolInBondingCurve * 2;
-  }
-
-  // Không có gì thì giữ nguyên, đừng reset về 0
-  return prevMcSol || 0;
+function estimateMarketCapSol(msg, prev = 0) {
+  if (msg.marketCapSol) return msg.marketCapSol;
+  if (msg.marketCapUsd) return msg.marketCapUsd / SOL_PRICE_USD;
+  if (msg.marketCap) return msg.marketCap / SOL_PRICE_USD;
+  if (msg.vSolInBondingCurve) return msg.vSolInBondingCurve * 2;
+  return prev;
 }
 
-function extractSolGeneric(e) {
-  if (e.solAmount > 0) return e.solAmount;
-  if (e.sol > 0) return e.sol;
-  if (e.lamports > 0) return e.lamports / 1e9;
-  if (e.amount > 0) return e.amount > 1e6 ? e.amount / 1e9 : e.amount;
+function extractSol(msg) {
+  if (msg.solAmount) return msg.solAmount;
+  if (msg.sol) return msg.sol;
+  if (msg.lamports) return msg.lamports / 1e9;
+  if (msg.amount) return msg.amount > 1e6 ? msg.amount / 1e9 : msg.amount;
   return 0;
 }
 
-function classifyBundle(totalSol, maxSingle) {
-  if (maxSingle >= 15) return "🐳 80%";
-  if (maxSingle >= 8 || totalSol >= 12) return "🚀 60%";
-  if (totalSol >= 5) return "🧨 50%";
+function classify(total, max) {
+  if (max >= 15) return "🐳 80%";
+  if (max >= 8 || total >= 12) return "🚀 60%";
+  if (total >= 5) return "🧨 50%";
   return "📌 BUNDLE";
 }
 
-async function sendAlert(mint, stats) {
-  const { trades, totalSol, maxSingle, dominancePercent, windowSec, createdAt, name, marketCapSol } = stats;
-
-  const type = classifyBundle(totalSol, maxSingle);
-  const axiom = `https://axiom.trade/t/${mint}`;
-
-  const embed = {
-    title: `🎯 ${type} — ${name ?? ""}`,
-    description:
-      `🧩 Trades: ${trades.length} trong ${windowSec}s\n` +
-      `💰 Total: ${totalSol.toFixed(2)} SOL\n` +
-      `💣 Biggest: ${maxSingle.toFixed(2)} SOL\n` +
-      `📊 Dominance: ${dominancePercent}%\n` +
-      `🏷 MarketCap: ~${marketCapSol.toFixed(1)} SOL (~$${(marketCapSol * SOL_PRICE_USD).toFixed(0)})\n` +
-      `📜 CA: \`${mint}\`\n\n`,
-    color: type === "🐳 80%" ? 0xff0000 : type === "🚀 60%" ? 0x00ff9d : 0xf7a600,
-    fields: [{ name: "🔗 OPEN", value: `[AXIOM](${axiom})` }],
-    timestamp: new Date().toISOString()
-  };
+// ================= ALERT =================
+async function sendAlert(mint, s, totalSol, maxSingle, dominance) {
+  const type = classify(totalSol, maxSingle);
 
   await axios.post(DISCORD_WEBHOOK_URL, {
     content: `@everyone 🔥 **BUNDLE DETECTED** — \`${mint}\``,
-    embeds: [embed]
+    embeds: [{
+      title: `🎯 ${type} — ${s.name}`,
+      description:
+        `🧩 Trades: ${s.trades.length}\n` +
+        `💰 Total: ${totalSol.toFixed(2)} SOL\n` +
+        `💣 Biggest: ${maxSingle.toFixed(2)} SOL\n` +
+        `📊 Dominance: ${dominance}%\n` +
+        `🏷 MC: ~${s.marketCapSol.toFixed(1)} SOL (~$${(s.marketCapSol * SOL_PRICE_USD).toFixed(0)})\n` +
+        `📜 CA: \`${mint}\``,
+      color: 0xf7a600,
+      timestamp: new Date().toISOString(),
+      fields: [{ name: "🔗 OPEN", value: `https://axiom.trade/t/${mint}` }]
+    }]
   });
-
-  log(`📩 Alert sent for ${mint}`);
 }
 
+// ================= CORE =================
 function recordTrade(mint, buyer, sol) {
   const s = ensureMint(mint);
+  const ts = now();
+  s.lastTs = ts;
 
-  s.trades.push({ ts: now(), buyer, sol });
-  s.trades = s.trades.filter(t => t.ts >= now() - BUNDLE_WINDOW_MS);
+  s.trades.push([ts, buyer, sol]);
 
-  const totalSol = s.trades.reduce((a, t) => a + t.sol, 0);
-  const maxSingle = Math.max(...s.trades.map(t => t.sol));
-  const byBuyer = s.trades.reduce((m, t) => {
-    m[t.buyer] = (m[t.buyer] || 0) + t.sol;
-    return m;
-  }, {});
-  const maxBuyerSol = Math.max(...Object.values(byBuyer));
-  const dominancePercent = ((maxBuyerSol / totalSol) * 100).toFixed(1);
-
-  if (DEBUG_TRADES) {
-    log(`TRADES[${mint}] total=${totalSol.toFixed(2)} maxSingle=${maxSingle.toFixed(2)} dom=${dominancePercent}% mc=${s.marketCapSol.toFixed(1)} SOL`);
+  const cutoff = ts - BUNDLE_WINDOW_MS;
+  while (s.trades.length && s.trades[0][0] < cutoff) {
+    s.trades.shift();
   }
 
   if (s.alerted) return;
 
-  const isBundle =
-    (s.trades.length >= MIN_TRADES && totalSol >= MIN_TOTAL_SOL) ||
-    (maxSingle >= BIG_SINGLE_BUY_SOL);
+  let total = 0;
+  let maxSingle = 0;
+  const buyerMap = Object.create(null);
 
-  // ❗ Stop nếu chưa đủ marketcap
+  for (const [, b, v] of s.trades) {
+    total += v;
+    maxSingle = Math.max(maxSingle, v);
+    buyerMap[b] = (buyerMap[b] || 0) + v;
+  }
+
+  const maxBuyer = Math.max(...Object.values(buyerMap));
+  const dominance = ((maxBuyer / total) * 100).toFixed(1);
+
+  const isBundle =
+    (s.trades.length >= MIN_TRADES && total >= MIN_TOTAL_SOL) ||
+    maxSingle >= BIG_SINGLE_BUY_SOL;
+
   if (isBundle && s.marketCapSol >= MIN_MARKETCAP_SOL) {
     s.alerted = true;
-    sendAlert(mint, {
-      ...s,
-      trades: s.trades,
-      totalSol,
-      maxSingle,
-      dominancePercent,
-      windowSec: (BUNDLE_WINDOW_MS / 1000).toFixed(1)
-    });
+    sendAlert(mint, s, total, maxSingle, dominance);
   }
 }
 
+// ================= WS HANDLERS =================
 function handleCreate(msg) {
   const s = ensureMint(msg.mint);
-  s.name = msg.name || msg.symbol || s.name;
+  s.name = msg.name || msg.symbol || "";
   s.marketCapSol = estimateMarketCapSol(msg, s.marketCapSol);
 
-  if (DEBUG_TRADES) {
-    log(`🆕 NEW TOKEN: ${s.name || ""} (${msg.mint}) ~${s.marketCapSol.toFixed(1)} SOL`);
-  }
-
-  // ✅ auto subscribe trades cho mint này
-  if (!s.subscribedTrade && ws && ws.readyState === WebSocket.OPEN) {
-    try {
-      ws.send(JSON.stringify({
-        method: "subscribeTokenTrade",
-        keys: [msg.mint]
-      }));
-      s.subscribedTrade = true;
-      log(`📡 Subscribed trades for ${msg.mint}`);
-    } catch (e) {
-      log(`⚠️ Failed to subscribeTokenTrade for ${msg.mint}: ${e.message}`);
-    }
+  if (!s.subscribed && ws?.readyState === 1) {
+    ws.send(JSON.stringify({
+      method: "subscribeTokenTrade",
+      keys: [msg.mint]
+    }));
+    s.subscribed = true;
   }
 }
 
 function handleBuy(msg) {
   const s = ensureMint(msg.mint);
-
-  // update marketcap estimate liên tục
   s.marketCapSol = estimateMarketCapSol(msg, s.marketCapSol);
+  s.lastTs = now();
 
-  if (typeof msg.vSolInBondingCurve === "number") {
-    const prev = s.lastVSOL ?? msg.vSolInBondingCurve;
-    const diff = msg.vSolInBondingCurve - prev;
-    if (diff > 0) {
-      recordTrade(msg.mint, msg.traderPublicKey || msg.trader || "unknown", diff);
-    }
+  if (msg.vSolInBondingCurve != null) {
+    const diff = msg.vSolInBondingCurve - s.lastVSOL;
+    if (diff > 0) recordTrade(msg.mint, msg.traderPublicKey || "unk", diff);
     s.lastVSOL = msg.vSolInBondingCurve;
   } else {
-    // fallback: dùng solAmount
-    const sol = extractSolGeneric(msg);
-    if (sol > 0) {
-      recordTrade(msg.mint, msg.traderPublicKey || msg.trader || msg.user || "unknown", sol);
-    }
+    const sol = extractSol(msg);
+    if (sol > 0) recordTrade(msg.mint, msg.trader || "unk", sol);
   }
-}
-
-function handleGeneric(msg) {
-  const mint = msg.mint;
-  if (!(msg.side === "buy" || msg.is_buy)) return;
-  const sol = extractSolGeneric(msg);
-  if (sol > 0) recordTrade(mint, msg.trader || msg.user || "unknown", sol);
 }
 
 function handleMsg(raw) {
   let msg;
   try { msg = JSON.parse(raw); } catch { return; }
-
-  if (DEBUG_TRADES) {
-    // log 1 phần cho dễ nhìn
-    log(`RAW: ${JSON.stringify(msg).slice(0, 200)}...`);
-  }
-
   if (!msg.mint) return;
 
-  // Các message từ PumpPortal:
-  // txType: "create" / "buy" / "sell"
-  if (msg.txType === "create") return handleCreate(msg);
-  if (msg.txType === "buy") return handleBuy(msg);
-
-  handleGeneric(msg);
+  if (msg.txType === "create") handleCreate(msg);
+  else if (msg.txType === "buy") handleBuy(msg);
 }
 
+// ================= CLEANUP =================
+setInterval(() => {
+  const t = now();
+  for (const mint in perMint) {
+    if (t - perMint[mint].lastTs > MINT_TTL_MS) {
+      delete perMint[mint];
+    }
+  }
+}, CLEANUP_INTERVAL_MS);
+
+// ================= CONNECT =================
 function connect() {
-  log("🔌 Connecting PumpPortal WS...");
   ws = new WebSocket(WS_URL);
 
   ws.on("open", () => {
-    log("✅ WS connected, subscribing new tokens...");
     ws.send(JSON.stringify({ method: "subscribeNewToken" }));
   });
 
   ws.on("message", handleMsg);
-
-  ws.on("close", () => {
-    log("⚠️ WS closed, reconnecting in 3s...");
-    setTimeout(connect, 3000);
-  });
-
-  ws.on("error", (err) => {
-    log(`❌ WS error: ${err.message}`);
-  });
+  ws.on("close", () => setTimeout(connect, 3000));
 }
 
-log("🚀 Pump Bundle Watch (with marketcap filter) running...");
 connect();
